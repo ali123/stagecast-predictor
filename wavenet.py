@@ -9,9 +9,8 @@ import tensorflow_io as tfio
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Input, Conv1D, Dense, Activation, Dropout, Lambda, Multiply, Add, Concatenate
 from tensorflow.keras.optimizers import Adam
-from generator import AudioGenerator
 
-EPOCHS = 40
+EPOCHS = 10
 EARLY_STOP = 100
 
 
@@ -25,10 +24,9 @@ parser = argparse.ArgumentParser()
 # data I/O
 parser.add_argument('-i', '--raw_inputs', type=str, help='path to file containing raw inputs (csv)')
 parser.add_argument('-p', '--pred_inputs', type=str, help='path to file containing previous predicted inputs (csv)')
-parser.add_argument('-l', '--input_length', type=int, default=11 help='power of 2 that represents the number of samples in the input')
+#parser.add_argument('-l', '--length', type=int, help='number of samples in the input')
+parser.add_argument('-m', '--missing', type=int, default=720, help='number of input samples missing')
 parser.add_argument('-o', '--output_length', type=int, default=120, help='number of samples to predict')
-parser.add_argument('-m', '--missing', type=int, default=1440, help='number of input samples missing')
-parser.add_argument('-b', '--batch_dize', type=int, default=1, help='batch size')
 parser.add_argument('-a', '--auxillary', type=str, help='path to auxillary file containing predictor state')
 parser.add_argument('-v', '--verbose', type=int, default=1, help='Verbosity either 0|1')
 
@@ -37,11 +35,14 @@ args = parser.parse_args()
 
 # -----------------------------------------------------------------------------
 
-audio = tfio.audio.AudioIOTensor('../no-posession/b16/OHR.wav')
+audio = tfio.audio.AudioIOTensor('sample_audio/OHR.wav')
 tensor = audio.to_tensor() #tf.squeeze(audio.to_tensor(), axis=[-1])
-n_layers = args.input_length
+tensor = tensor / 2**15
+# print(tensor.dtype)
+# print(tf.math.reduce_min(tensor), tf.math.reduce_max(tensor))
+n_layers = 11
 input_length = 2**n_layers
-output_length = args.output_length
+output_length = 120
 num_train_samples = 100
 num_val_samples = 20
 num_test_samples = 20
@@ -51,7 +52,7 @@ decoder_target_data = np.zeros((num_train_samples, output_length,1))
 
 for i in range(num_train_samples):
   encoder_input_data[i] = tensor[i:i+input_length]
-  decoder_target_data[i] = tensor[args.missing+i+input_length:args.missing+i+input_length+output_length]
+  decoder_target_data[i] = tensor[i+input_length:i+input_length+output_length]
 
 
 val_encoder_input_data = np.zeros((num_val_samples, input_length,1))
@@ -60,7 +61,7 @@ tensor = tensor[num_train_samples:]
 
 for i in range(num_val_samples):
   val_encoder_input_data[i] = tensor[i:i+input_length]
-  val_decoder_target_data[i] = tensor[args.missing+i+input_length:args.missing+i+input_length+output_length]
+  val_decoder_target_data[i] = tensor[i+input_length:i+input_length+output_length]
 
 test_encoder_input_data = np.zeros((num_test_samples, input_length,1))
 test_decoder_target_data = np.zeros((num_test_samples, output_length,1))
@@ -68,10 +69,12 @@ tensor = tensor[num_val_samples:]
 
 for i in range(num_test_samples):
   test_encoder_input_data[i] = tensor[i:i+input_length]
-  test_decoder_target_data[i] = tensor[args.missing+i+input_length:args.missing+i+input_length+output_length]
+  test_decoder_target_data[i] = tensor[i+input_length:i+input_length+output_length]
 
 def train_test_model(hparams):
     
+    
+    batch_size = 10 #2**n_layers
     # convolutional operation parameters
     n_filters = hparams[HP_NUM_FILTERS] # 32 
     filter_width = 2
@@ -120,6 +123,7 @@ def train_test_model(hparams):
     out = Activation('relu')(out)
     out = Dropout(hparams[HP_DROPOUT])(out)
     out = Conv1D(output_length, 1, padding='same')(out)
+    out = Activation('tanh')(out)
 
     # extract the last 60 time steps as the training target
     def slice(x, seq_length):
@@ -133,20 +137,16 @@ def train_test_model(hparams):
     # print(model.summary())
     # raise ValueError
 
-    train_generator = AudioGenerator(audio_files, input_length, output_length, args.missing, 0, 80, args.batch_size)
-    val_generator = AudioGenerator(audio_files, input_length, output_length, args.missing, 80, 100, args.batch_size)
-
     model.compile(Adam(), loss='mean_absolute_error')
-    history = model.fit(train_generator,
-                        #encoder_input_data, decoder_target_data,
+    history = model.fit(encoder_input_data, decoder_target_data,
                         verbose=args.verbose,
-                        validation_data=val_generator,
-                        #validation_data=(val_encoder_input_data, val_decoder_target_data),
-                        #batch_size=args.batch_size,
+                        validation_data=(val_encoder_input_data, val_decoder_target_data),
+                        batch_size=batch_size,
                         epochs=EPOCHS,
                         callbacks=[early_stop])
 
     model.save('saved_model/my_model')
+
 
     loss = model.evaluate(test_encoder_input_data, test_decoder_target_data)
     print(len(history.history['loss']))

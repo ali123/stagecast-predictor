@@ -1,4 +1,7 @@
-json
+matplotlib
 argparse
 numpy
+scipy
 tensorflow
+torchvision
+librosa

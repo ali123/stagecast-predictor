@@ -2,6 +2,7 @@ import json
 import argparse
 import numpy as np
 import time, sys, math
+import pathlib
 from scipy.io import wavfile
 import torch
 import torch.nn as nn
@@ -287,13 +288,16 @@ fine_classes = np.reshape(fine_classes, (batch_size, -1))
 model = WaveRNN(hidden_size=200, quantisation=256)
 optimizer = optim.Adam(model.parameters())
 train(model, optimizer, num_steps=EPOCHS, batch_size=batch_size, lr=1e-3)
+pathlib.Path("torch/saved_models/").mkdir(parents=True, exist_ok=True)
 torch.save(model, 'torch/saved_models/wavernn.pt')
 
+#### load model and generate
 model = torch.load('torch/saved_models/wavernn.pt')
 model.eval()
 
 output, c, f, hidden = generate(model, 120)
 output = np.clip(output, -2**15, 2**15 - 1)
+pathlib.Path("torch/outputs/").mkdir(parents=True, exist_ok=True)
 wavfile.write('torch/outputs/wavernn_output.wav', sample_rate, output.astype(np.int16))
 
 

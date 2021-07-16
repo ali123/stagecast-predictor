@@ -11,7 +11,7 @@ from torch import optim
 from utils.display import *
 from utils.dsp import *
 
-EPOCHS = 10
+EPOCHS = 2
 EARLY_STOP = 100
 
 class WaveRNN(nn.Module) :
@@ -22,8 +22,16 @@ class WaveRNN(nn.Module) :
         self.split_size = hidden_size // 2
         
         # The main matmul
-        self.R = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=False)
+        #self.R = nn.Linear(self.hidden_size, 3 * self.hidden_size, bias=False)
         
+        self.R_u = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.R_r = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+        self.R_e = nn.Linear(self.hidden_size, self.hidden_size, bias=False)
+
+        #self.mask_u = np.ones((self.hidden_size, self.hidden_size), dtype=np.int8)
+        #self.mask_r = np.ones((self.hidden_size, self.hidden_size), dtype=np.int8)
+        #self.mask_e = np.ones((self.hidden_size, self.hidden_size), dtype=np.int8)
+
         # Output fc layers
         self.O1 = nn.Linear(self.split_size, self.split_size)
         self.O2 = nn.Linear(self.split_size, quantisation)
@@ -46,9 +54,13 @@ class WaveRNN(nn.Module) :
     def forward(self, prev_y, prev_hidden, current_coarse) :
         
         # Main matmul - the projection is split 3 ways
-        R_hidden = self.R(prev_hidden)
-        R_u, R_r, R_e, = torch.split(R_hidden, self.hidden_size, dim=1)
+        #R_hidden = self.R(prev_hidden)
+        #R_u, R_r, R_e, = torch.split(R_hidden, self.hidden_size, dim=1)
         
+        R_u = self.R_u(prev_hidden)
+        R_r = self.R_r(prev_hidden)
+        R_e = self.R_e(prev_hidden)
+
         # Project the prev input 
         coarse_input_proj = self.I_coarse(prev_y)
         I_coarse_u, I_coarse_r, I_coarse_e = \
@@ -92,7 +104,26 @@ class WaveRNN(nn.Module) :
         print('Trainable Parameters: %.3f million' % parameters)
 
 
-def train(model, optimizer, num_steps, batch_size, lr=1e-3, seq_len=960) :
+def get_sparsity(Z, t, t_0, S):
+    return Z*(1-(1-(t-t_0)/S)**3)
+
+
+def update_sparse_weights(layer, z):
+    weights = layer.weight.data.numpy()
+    #mask = np.ones(weights.shape)
+    f_weights = np.abs(weights.flatten())
+    f_weights.sort()
+    pivot = f_weights[int(z*len(f_weights))]
+    mask = np.abs(weights) > pivot
+    weights = weights * mask
+    print(z, pivot)
+    #print(weights)
+    #print(mask)
+    #raise
+    return torch.nn.Parameter(torch.tensor(weights)), mask
+
+
+def train(model, optimizer, num_steps, batch_size, lr=1e-3, seq_len=960, target_sparsity=.95, t_0=0, num_steps_sparsity_update=1) :
     
     for p in optimizer.param_groups : p['lr'] = lr
     start = time.time()
@@ -140,13 +171,22 @@ def train(model, optimizer, num_steps, batch_size, lr=1e-3, seq_len=960) :
         running_loss += (loss.item() / seq_len)
         loss.backward()
         optimizer.step()
+
+        if step >= t_0 and step % num_steps_sparsity_update == 0:
+          z = get_sparsity(target_sparsity, step, t_0, num_steps)
+          model.R_u.weight, model.mask_u = update_sparse_weights(model.R_u, z)
+          model.R_r.weight, model.mask_r = update_sparse_weights(model.R_r, z)
+          model.R_e.weight, model.mask_e = update_sparse_weights(model.R_e, z)
+          #print(model.R_e.weight)
+          #raise
+          #module.weight = torch.nn.Parameter(module.weight.data.to_sparse())
+
         
         elapsed = time_since(start)
         speed = (step + 1) / (time.time() - start)
         
         stream('Step: %i/%i --- Loss: %.3f --- %s --- @ %.1f batches/sec ',
               (step + 1, num_steps, running_loss / (step + 1), elapsed, speed))
-
 
 def generate(model, seq_len, hidden=None) :
         
@@ -168,11 +208,28 @@ def generate(model, seq_len, hidden=None) :
             # We'll need a hidden state
             hidden = model.init_hidden()
 
-        # Need a clock for display
-        start = time.time()
+        
         cc_outputs = np.zeros(seq_len, dtype=np.uint8)
         ff_outputs = np.zeros(seq_len, dtype=np.uint8)
 
+        #make weights sparse
+        # model.R_u.weight = torch.nn.Parameter(model.R_u.weight.data.to_sparse())
+        # print(model.R_u.weight)
+        #raise
+        #model.R_r.weight = torch.nn.Parameter(model.R_r.weight.data.to_sparse())
+        #model.R_e.weight = torch.nn.Parameter(model.R_e.weight.data.to_sparse())
+        w_u = model.R_u.weight.data.to_sparse().to('cpu').coalesce()
+        w_r = model.R_r.weight.data.to_sparse()
+        w_e = model.R_e.weight.data.to_sparse()
+        from scipy.sparse import coo_matrix, csr_matrix
+        scipy_w_u = coo_matrix((w_u.values(), (w_u.indices()[0], w_u.indices()[1])), shape=w_u.shape)
+        csr_w_u = csr_matrix(scipy_w_u)
+        numpy_w_u = model.R_u.weight.data.numpy()
+        # print(w_u)
+        # raise
+        
+        # Need a clock for display
+        start = time.time()
         # Loop for generation
         for i in range(seq_len) :
 
@@ -191,10 +248,32 @@ def generate(model, seq_len, hidden=None) :
                 torch.split(coarse_input_proj, model.split_size, dim=1)
 
             # Project hidden state and split 6 ways
-            R_hidden = model.R(hidden)
-            R_coarse_u , R_fine_u, \
-            R_coarse_r, R_fine_r, \
-            R_coarse_e, R_fine_e = torch.split(R_hidden, model.split_size, dim=1)
+            # R_hidden = model.R(hidden)
+            # R_coarse_u , R_fine_u, \
+            # R_coarse_r, R_fine_r, \
+            # R_coarse_e, R_fine_e = torch.split(R_hidden, model.split_size, dim=1)
+            #print(hidden)
+            #print('a')
+            #w = torch.nn.Parameter(model.R_u.weight.data.to_sparse())
+            torch.sparse.mm(w_u,torch.t(hidden))
+            torch.mm(w_u,torch.t(hidden))
+            torch.mm(model.R_u.weight.data,torch.t(hidden))
+            w_u.mm(torch.t(hidden))
+            w_u.mm(torch.t(hidden))
+            scipy_w_u.dot(hidden.numpy().T)
+            csr_w_u.dot(hidden.numpy().T)
+            numpy_w_u.dot(hidden.numpy().T)
+            #R_u = torch.t(RRR)
+            R_r = torch.t(w_r.mm(torch.t(hidden)))
+            R_e = torch.t(w_e.mm(torch.t(hidden)))
+            #print('b')
+            R_u = model.R_u(hidden)
+            R_r = model.R_r(hidden)
+            R_e = model.R_e(hidden)
+
+            R_coarse_u , R_fine_u = torch.split(R_u, model.split_size, dim=1)
+            R_coarse_r , R_fine_r = torch.split(R_r, model.split_size, dim=1)
+            R_coarse_e , R_fine_e = torch.split(R_e, model.split_size, dim=1)
 
             # Compute the coarse gates
             u = torch.sigmoid(R_coarse_u + I_coarse_u + b_coarse_u)
@@ -205,8 +284,9 @@ def generate(model, seq_len, hidden=None) :
             # Compute the coarse output
             out_coarse = model.O2(F.relu(model.O1(hidden_coarse)))
             posterior = F.softmax(out_coarse, dim=1)
-            distrib = torch.distributions.Categorical(posterior)
-            out_coarse = distrib.sample()
+            #distrib = torch.distributions.Categorical(posterior)
+            #out_coarse = distrib.sample()
+            out_coarse = torch.multinomial(posterior, 1, True)[0]
             c_outputs.append(out_coarse)
             #cc_outputs[i] = out_coarse.numpy()
 
@@ -226,8 +306,9 @@ def generate(model, seq_len, hidden=None) :
             # Compute the fine output
             out_fine = model.O4(F.relu(model.O3(hidden_fine)))
             posterior = torch.softmax(out_fine, dim=1)
-            distrib = torch.distributions.Categorical(posterior)
-            out_fine = distrib.sample()
+            #distrib = torch.distributions.Categorical(posterior)
+            #out_fine = distrib.sample()
+            out_fine = torch.multinomial(posterior, 1, True)[0]
             f_outputs.append(out_fine)
             #ff_outputs[i]= out_fine.numpy() 
 
@@ -285,7 +366,7 @@ fine_classes = fine_classes[:len(fine_classes) // batch_size * batch_size]
 coarse_classes = np.reshape(coarse_classes, (batch_size, -1))
 fine_classes = np.reshape(fine_classes, (batch_size, -1))
 
-model = WaveRNN(hidden_size=200, quantisation=256)
+model = WaveRNN(hidden_size=1024, quantisation=256)
 optimizer = optim.Adam(model.parameters())
 train(model, optimizer, num_steps=EPOCHS, batch_size=batch_size, lr=1e-3)
 pathlib.Path("torch/saved_models/").mkdir(parents=True, exist_ok=True)
@@ -294,6 +375,12 @@ torch.save(model, 'torch/saved_models/wavernn.pt')
 #### load model and generate
 model = torch.load('torch/saved_models/wavernn.pt')
 model.eval()
+from line_profiler import LineProfiler
+num_samples = 120
+lp = LineProfiler()
+lp_wrapper = lp(generate)
+lp_wrapper(model, 120)
+lp.print_stats()
 
 output, c, f, hidden = generate(model, 120)
 output = np.clip(output, -2**15, 2**15 - 1)

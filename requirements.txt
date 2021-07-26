@@ -3,5 +3,6 @@ argparse
 numpy
 scipy
 tensorflow
+tensorflow_io
 torchvision
 librosa

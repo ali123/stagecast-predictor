@@ -366,11 +366,13 @@ fine_classes = fine_classes[:len(fine_classes) // batch_size * batch_size]
 coarse_classes = np.reshape(coarse_classes, (batch_size, -1))
 fine_classes = np.reshape(fine_classes, (batch_size, -1))
 
-model = WaveRNN(hidden_size=1024, quantisation=256)
+model = WaveRNN(hidden_size=200, quantisation=256)
 optimizer = optim.Adam(model.parameters())
 train(model, optimizer, num_steps=EPOCHS, batch_size=batch_size, lr=1e-3)
 pathlib.Path("torch/saved_models/").mkdir(parents=True, exist_ok=True)
 torch.save(model, 'torch/saved_models/wavernn.pt')
+sm = torch.jit.script(model)
+sm.save('torch/saved_models/wavernn-sm.pt')
 
 #### load model and generate
 model = torch.load('torch/saved_models/wavernn.pt')
